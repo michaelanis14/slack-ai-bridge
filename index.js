@@ -13,6 +13,9 @@ const app = new App({
 // Track running tasks
 const runningTasks = new Map(); // threadId -> { process, startTime }
 
+// Track thread to session ID mapping for cleanup
+const sessionTracking = new Map(); // threadId -> sessionId
+
 // Rate limiter for Slack API calls
 class SlackRateLimiter {
   constructor(messagesPerSecond = 1) {
@@ -205,11 +208,14 @@ USER REQUEST: ${prompt}`;
               // Session initialization
               if (msg.subtype === 'init' && msg.session_id) {
                 sessionId = msg.session_id;
+                // Track session for cleanup
+                sessionTracking.set(threadTs, sessionId);
+                console.log(`[SESSION] Tracking session ${sessionId.slice(0, 8)}... for thread ${threadTs.slice(-8)}`);
                 // Use rate limiter - fire and forget
                 slackRateLimiter.sendMessage(() =>
                   app.client.chat.postMessage({
                     channel: channel,
-                    text: `🆔 *Claude Code Session Started*\n\n*Session ID:* \`${sessionId}\`\n\n*To Resume:*\n\`\`\`\nclaude --resume ${sessionId}\n\`\`\`\n*View Full Session:* https://claude.ai/code/${sessionId}\n\n_Session will be available for resuming until it expires._`,
+                    text: `🆔 *Claude Code Session Started*\n\n*Session ID:* \`${sessionId}\`\n\n*To Resume:*\n\`\`\`\nclaude --resume ${sessionId}\n\`\`\`\n_Session will be available for resuming until it expires._`,
                     thread_ts: threadTs,
                     token: process.env.SLACK_BOT_TOKEN
                   })
@@ -469,10 +475,14 @@ USER REQUEST: ${promptWithContext}`;
 
     // Send session info first if available
     if (response.sessionId) {
+      // Track session for cleanup
+      sessionTracking.set(threadTs, response.sessionId);
+      console.log(`[SESSION] Tracking session ${response.sessionId.slice(0, 8)}... for thread ${threadTs.slice(-8)}`);
+
       await slackRateLimiter.sendMessage(() =>
         app.client.chat.postMessage({
           channel: channel,
-          text: `🆔 *Claude Code Session Started*\n\n*Session ID:* \`${response.sessionId}\`\n\n*To Resume:*\n\`\`\`\nclaude --resume ${response.sessionId}\n\`\`\`\n*View Full Session:* https://claude.ai/code/${response.sessionId}\n\n_Session will be available for resuming until it expires._`,
+          text: `🆔 *Claude Code Session Started*\n\n*Session ID:* \`${response.sessionId}\`\n\n*To Resume:*\n\`\`\`\nclaude --resume ${response.sessionId}\n\`\`\`\n_Session will be available for resuming until it expires._`,
           thread_ts: threadTs,
           token: process.env.SLACK_BOT_TOKEN
         })
@@ -527,6 +537,38 @@ app.event("app_mention", async ({ event, say, client }) => {
   }
 });
 
+// Handle message deletions - cleanup associated sessions
+app.event("message_deleted", async ({ event }) => {
+  try {
+    const deletedTs = event.deleted_ts;
+
+    // Check if this message had an associated session
+    if (sessionTracking.has(deletedTs)) {
+      const sessionId = sessionTracking.get(deletedTs);
+      console.log(`[CLEANUP] Message ${deletedTs.slice(-8)} deleted, cleaning up session ${sessionId.slice(0, 8)}...`);
+
+      // Kill running process if exists
+      if (runningTasks.has(deletedTs)) {
+        const task = runningTasks.get(deletedTs);
+        try {
+          task.process.kill('SIGTERM');
+          console.log(`[CLEANUP] Killed Claude process for deleted thread ${deletedTs.slice(-8)}`);
+        } catch (e) {
+          console.error(`[CLEANUP] Failed to kill process:`, e.message);
+        }
+        runningTasks.delete(deletedTs);
+      }
+
+      // Remove from session tracking
+      sessionTracking.delete(deletedTs);
+
+      console.log(`[CLEANUP] Session cleanup complete for ${deletedTs.slice(-8)}`);
+    }
+  } catch (error) {
+    console.error('[CLEANUP ERROR]', error);
+  }
+});
+
 // Show running tasks and context status
 setInterval(() => {
   if (runningTasks.size > 0) {
@@ -550,7 +592,7 @@ setInterval(() => {
 
 app.start().then(() => {
   console.log('╔═══════════════════════════════════════════════════╗');
-  console.log('║  🧠 Context Memory Bridge v2.5.2                  ║');
+  console.log('║  🧠 Context Memory Bridge v2.6.0                  ║');
   console.log('║                                                   ║');
   console.log('║  ✅ Auto-respond in configured channels           ║');
   console.log('║  ✅ Remembers conversations within threads        ║');
