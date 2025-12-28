@@ -352,9 +352,17 @@ USER REQUEST: ${prompt}`;
 
 // Helper function to process messages (shared by app_mention and message events)
 async function processMessage(event, say, client, isMention) {
+  // Extract text - different structure for message vs app_mention events
+  const rawText = event.text || '';
+
+  if (!rawText) {
+    console.log('[PROCESS] No text in message, skipping');
+    return;
+  }
+
   const msg = isMention
-    ? event.text.replace(/<@[^>]+>/g, '').replace(/[*_~`]/g, '').trim()
-    : event.text.replace(/[*_~`]/g, '').trim();
+    ? rawText.replace(/<@[^>]+>/g, '').replace(/[*_~`]/g, '').trim()
+    : rawText.replace(/[*_~`]/g, '').trim();
   const threadTs = event.thread_ts || event.ts;
   const channel = event.channel;
   const isNewThread = !event.thread_ts;
@@ -592,7 +600,7 @@ setInterval(() => {
 
 app.start().then(() => {
   console.log('╔═══════════════════════════════════════════════════╗');
-  console.log('║  🧠 Context Memory Bridge v2.6.0                  ║');
+  console.log('║  🧠 Context Memory Bridge v2.6.1                  ║');
   console.log('║                                                   ║');
   console.log('║  ✅ Auto-respond in configured channels           ║');
   console.log('║  ✅ Remembers conversations within threads        ║');
