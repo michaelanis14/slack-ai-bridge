@@ -62,6 +62,17 @@ class SlackRateLimiter {
 // Global rate limiter - 1 message per second to respect Slack's limits
 const slackRateLimiter = new SlackRateLimiter(1);
 
+// Parse auto-respond channels from environment
+const autoRespondChannels = new Set(
+  (process.env.SLACK_AUTO_CHANNELS || '').split(',').map(c => c.trim()).filter(c => c)
+);
+
+if (autoRespondChannels.size > 0) {
+  console.log(`[CONFIG] Auto-respond enabled for ${autoRespondChannels.size} channel(s)`);
+} else {
+  console.log(`[CONFIG] Auto-respond disabled - only responding to @mentions`);
+}
+
 async function askClaudeAsync(prompt, originalMsg, channel, threadTs, client) {
   console.log(`[ASYNC-TASK] Starting for thread ${threadTs}`);
 
@@ -333,140 +344,166 @@ USER REQUEST: ${prompt}`;
   });
 }
 
-app.event("app_mention", async ({ event, say, client }) => {
-  try {
-    const msg = event.text.replace(/<@[^>]+>/g, '').replace(/[*_~`]/g, '').trim();
-    const threadTs = event.thread_ts || event.ts;
-    const channel = event.channel;
-    const isNewThread = !event.thread_ts;
+// Helper function to process messages (shared by app_mention and message events)
+async function processMessage(event, say, client, isMention) {
+  const msg = isMention
+    ? event.text.replace(/<@[^>]+>/g, '').replace(/[*_~`]/g, '').trim()
+    : event.text.replace(/[*_~`]/g, '').trim();
+  const threadTs = event.thread_ts || event.ts;
+  const channel = event.channel;
+  const isNewThread = !event.thread_ts;
 
-    if (!msg) {
-      await say({
-        text: "Hi! I can handle long-running tasks and remember our conversation!",
-        thread_ts: threadTs
-      });
-      return;
-    }
+  if (!msg) {
+    await say({
+      text: "Hi! I can handle long-running tasks and remember our conversation!",
+      thread_ts: threadTs
+    });
+    return;
+  }
 
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`[${isNewThread ? 'NEW THREAD' : 'THREAD REPLY'}] ${msg}`);
-    console.log(`Thread ID: ${threadTs}`);
-    console.log(`${'='.repeat(60)}`);
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`[${isNewThread ? 'NEW THREAD' : 'THREAD REPLY'}] ${msg}`);
+  console.log(`Thread ID: ${threadTs}`);
+  console.log(`${'='.repeat(60)}`);
 
-    // BUILD PROMPT WITH CONTEXT - This is the key change!
-    const promptWithContext = buildPromptWithContext(threadTs, msg);
+  // BUILD PROMPT WITH CONTEXT - This is the key change!
+  const promptWithContext = buildPromptWithContext(threadTs, msg);
 
-    // Log if using context
-    if (promptWithContext !== msg) {
-      console.log(`[CONTEXT] Using history for context`);
-    }
+  // Log if using context
+  if (promptWithContext !== msg) {
+    console.log(`[CONTEXT] Using history for context`);
+  }
 
-    // Detect if this is likely a long-running task
-    const isLongTask = /run.*test|build|deploy|analyze.*all|scan|compile|install/i.test(msg);
+  // Detect if this is likely a long-running task
+  const isLongTask = /run.*test|build|deploy|analyze.*all|scan|compile|install/i.test(msg);
 
-    if (isLongTask) {
-      console.log('[LONG-TASK] Detected, running async');
+  if (isLongTask) {
+    console.log('[LONG-TASK] Detected, running async');
 
-      // Immediate acknowledgment
-      await say({
-        text: `🔄 Working on this... I'll reply in this thread when complete.\n\n_Task: ${msg}_`,
-        thread_ts: threadTs
-      });
+    // Immediate acknowledgment
+    await say({
+      text: `🔄 Working on this... I'll reply in this thread when complete.\n\n_Task: ${msg}_`,
+      thread_ts: threadTs
+    });
 
-      await client.reactions.add({
-        channel: channel,
-        timestamp: event.ts,
-        name: "rocket"
-      }).catch(() => {});
+    await client.reactions.add({
+      channel: channel,
+      timestamp: event.ts,
+      name: "rocket"
+    }).catch(() => {});
 
-      // Start async task (doesn't wait) - pass original msg for context storage
-      askClaudeAsync(promptWithContext, msg, channel, threadTs, client);
+    // Start async task (doesn't wait) - pass original msg for context storage
+    askClaudeAsync(promptWithContext, msg, channel, threadTs, client);
 
-    } else {
-      // Regular short task - wait for response
-      console.log('[SHORT-TASK] Running sync');
+  } else {
+    // Regular short task - wait for response
+    console.log('[SHORT-TASK] Running sync');
 
-      await client.reactions.add({
-        channel: channel,
-        timestamp: event.ts,
-        name: "brain"  // Brain emoji to indicate context awareness
-      }).catch(() => {});
+    await client.reactions.add({
+      channel: channel,
+      timestamp: event.ts,
+      name: "brain"  // Brain emoji to indicate context awareness
+    }).catch(() => {});
 
-      // Quick synchronous execution with context
-      // Add Docker environment context
-      const enhancedPrompt = `SYSTEM CONTEXT: Docker-based development environment.
+    // Quick synchronous execution with context
+    // Add Docker environment context
+    const enhancedPrompt = `SYSTEM CONTEXT: Docker-based development environment.
 Backend (Java/Kotlin/Gradle) runs ONLY in Docker containers.
 For backend tests: Use "docker-compose exec backend ./gradlew test"
 NEVER say "Java is not installed" - use Docker!
 
 USER REQUEST: ${promptWithContext}`;
 
-      const response = await new Promise((resolve) => {
-        const claude = spawn('/usr/bin/claude', [
-          '-p', enhancedPrompt,
-          '--dangerously-skip-permissions',
-          '--output-format', 'stream-json',
-          '--verbose'
-        ], {
-          cwd: '/opt/devenv/projects/sphinx-ai',
-          env: {
-            ...process.env,
-            // Inherit full environment including Docker, Java, etc.
-            HOME: '/home/developer',
-            USER: 'developer'
-            // PATH is inherited from process.env via spread operator
-          },
-          stdio: ['ignore', 'pipe', 'pipe']
-        });
-
-        let output = '';
-        let result = '';
-
-        claude.stdout.on('data', d => {
-          output += d.toString();
-          // Try to extract result from JSON stream
-          const lines = output.split('\n');
-          for (const line of lines) {
-            try {
-              const msg = JSON.parse(line);
-              if (msg.type === 'result' && msg.result) {
-                result = msg.result;
-              }
-            } catch (e) {
-              // Not JSON, ignore
-            }
-          }
-        });
-
-        claude.stderr.on('data', d => output += d);
-        claude.on('close', () => resolve(result || output.trim() || 'No output'));
-
-        setTimeout(() => {
-          claude.kill();
-          resolve(result || output.trim() || 'Timeout');
-        }, 90000);
+    const response = await new Promise((resolve) => {
+      const claude = spawn('/usr/bin/claude', [
+        '-p', enhancedPrompt,
+        '--dangerously-skip-permissions',
+        '--output-format', 'stream-json',
+        '--verbose'
+      ], {
+        cwd: '/opt/devenv/projects/sphinx-ai',
+        env: {
+          ...process.env,
+          // Inherit full environment including Docker, Java, etc.
+          HOME: '/home/developer',
+          USER: 'developer'
+          // PATH is inherited from process.env via spread operator
+        },
+        stdio: ['ignore', 'pipe', 'pipe']
       });
 
-      // STORE IN CONTEXT
-      addToThreadContext(threadTs, msg, response);
+      let output = '';
+      let result = '';
 
-      await say({ text: response.slice(0, 3000), thread_ts: threadTs });
+      claude.stdout.on('data', d => {
+        output += d.toString();
+        // Try to extract result from JSON stream
+        const lines = output.split('\n');
+        for (const line of lines) {
+          try {
+            const msg = JSON.parse(line);
+            if (msg.type === 'result' && msg.result) {
+              result = msg.result;
+            }
+          } catch (e) {
+            // Not JSON, ignore
+          }
+        }
+      });
 
-      await client.reactions.remove({
-        channel: channel,
-        timestamp: event.ts,
-        name: "brain"
-      }).catch(() => {});
+      claude.stderr.on('data', d => output += d);
+      claude.on('close', () => resolve(result || output.trim() || 'No output'));
 
-      await client.reactions.add({
-        channel: channel,
-        timestamp: event.ts,
-        name: "white_check_mark"
-      }).catch(() => {});
-    }
+      setTimeout(() => {
+        claude.kill();
+        resolve(result || output.trim() || 'Timeout');
+      }, 90000);
+    });
 
+    // STORE IN CONTEXT
+    addToThreadContext(threadTs, msg, response);
+
+    await say({ text: response.slice(0, 3000), thread_ts: threadTs });
+
+    await client.reactions.remove({
+      channel: channel,
+      timestamp: event.ts,
+      name: "brain"
+    }).catch(() => {});
+
+    await client.reactions.add({
+      channel: channel,
+      timestamp: event.ts,
+      name: "white_check_mark"
+    }).catch(() => {});
+  }
+}
+
+// Handle regular channel messages (auto-respond channels)
+app.event("message", async ({ event, say, client }) => {
+  try {
+    // Ignore bot messages
+    if (event.bot_id || event.subtype === 'bot_message') return;
+
+    // Ignore threaded messages (they'll be handled by app_mention or message in thread)
+    if (event.thread_ts) return;
+
+    // Only respond in configured auto-respond channels
+    if (!autoRespondChannels.has(event.channel)) return;
+
+    console.log(`[AUTO-CHANNEL] Message in ${event.channel}`);
+    await processMessage(event, say, client, false);
   } catch (error) {
-    console.error('[ERROR]', error);
+    console.error('[AUTO-CHANNEL ERROR]', error);
+  }
+});
+
+// Handle @mentions
+app.event("app_mention", async ({ event, say, client }) => {
+  try {
+    await processMessage(event, say, client, true);
+  } catch (error) {
+    console.error('[MENTION ERROR]', error);
     await say({
       text: 'Error: ' + error.message,
       thread_ts: event.thread_ts || event.ts
@@ -497,8 +534,9 @@ setInterval(() => {
 
 app.start().then(() => {
   console.log('╔═══════════════════════════════════════════════════╗');
-  console.log('║  🧠 Context Memory Bridge v2.4.1                  ║');
+  console.log('║  🧠 Context Memory Bridge v2.5.0                  ║');
   console.log('║                                                   ║');
+  console.log('║  ✅ Auto-respond in configured channels           ║');
   console.log('║  ✅ Remembers conversations within threads        ║');
   console.log('║  ✅ Structured JSON streaming                     ║');
   console.log('║  ✅ Rate-limited Slack API (1 msg/sec)            ║');
@@ -508,5 +546,5 @@ app.start().then(() => {
   console.log('║  ✅ Auto-cleanup after 30min idle                 ║');
   console.log('║  ✅ Docker-aware for backend tests                ║');
   console.log('╚═══════════════════════════════════════════════════╗');
-  console.log('Ready with rate-limited streaming!');
+  console.log('Ready! No @mention needed in configured channels.');
 });
