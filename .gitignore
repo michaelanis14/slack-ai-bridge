@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+
+# Logs
+*.log
+nohup.out
+
+# System
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

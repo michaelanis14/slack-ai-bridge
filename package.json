@@ -1,0 +1,34 @@
+{
+  "name": "slack-claude-bridge",
+  "version": "2.2.0",
+  "description": "Bridge between Slack and Claude Code with conversation context memory, streaming progress updates, and MCP server access",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "pm2": "pm2 start index.js --name slack-claude-bridge",
+    "test": "jest",
+    "test:watch": "jest --watch"
+  },
+  "keywords": [
+    "slack",
+    "claude",
+    "mcp",
+    "ai",
+    "bridge"
+  ],
+  "author": "Sphinx AI Team",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "@slack/bolt": "^3.22.0",
+    "dotenv": "^17.2.3"
+  },
+  "devDependencies": {
+    "jest": "^30.2.0",
+    "nodemon": "^3.1.9"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

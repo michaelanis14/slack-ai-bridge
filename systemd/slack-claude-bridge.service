@@ -1,0 +1,20 @@
+[Unit]
+Description=Slack-Claude Bridge
+After=network.target
+
+[Service]
+Type=simple
+User=developer
+WorkingDirectory=/opt/devenv/projects/sphinx-ai/slack-claude-bridge
+ExecStart=/usr/bin/node index.js
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=slack-claude-bridge
+
+# Load environment from .env file
+EnvironmentFile=/opt/devenv/projects/sphinx-ai/slack-claude-bridge/.env
+
+[Install]
+WantedBy=multi-user.target
