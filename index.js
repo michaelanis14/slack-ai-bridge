@@ -16,6 +16,9 @@ const runningTasks = new Map(); // threadId -> { process, startTime }
 // Track thread to session ID mapping for cleanup
 const sessionTracking = new Map(); // threadId -> sessionId
 
+// Track threads that have already shown session info (only show once per thread)
+const threadsWithSessionInfo = new Set(); // threadId
+
 // Rate limiter for Slack API calls
 class SlackRateLimiter {
   constructor(messagesPerSecond = 1) {
@@ -211,15 +214,7 @@ USER REQUEST: ${prompt}`;
                 // Track session for cleanup
                 sessionTracking.set(threadTs, sessionId);
                 console.log(`[SESSION] Tracking session ${sessionId.slice(0, 8)}... for thread ${threadTs.slice(-8)}`);
-                // Use rate limiter - fire and forget
-                slackRateLimiter.sendMessage(() =>
-                  app.client.chat.postMessage({
-                    channel: channel,
-                    text: `🆔 *Claude Code Session Started*\n\n*Session ID:* \`${sessionId}\`\n\n*To Resume:*\n\`\`\`\nclaude --resume ${sessionId}\n\`\`\`\n_Session will be available for resuming until it expires._`,
-                    thread_ts: threadTs,
-                    token: process.env.SLACK_BOT_TOKEN
-                  })
-                ).catch(e => console.error('[SESSION] Failed to send:', e.message));
+                // Don't send separate message - will be included inline with response
               }
               break;
 
@@ -305,10 +300,18 @@ USER REQUEST: ${prompt}`;
       const seconds = (duration % 60).toFixed(1);
       const timeStr = minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 
+      // Include session info inline if this is first reply in thread
+      let summaryText = `✅ *Task Complete*\n\n⏱️ Duration: ${timeStr}\n📊 Output Chunks: ${chunkCount}\n📝 Total Output: ${output.length} characters\n✅ Exit Code: ${code}`;
+
+      if (sessionId && !threadsWithSessionInfo.has(threadTs)) {
+        summaryText += `\n\n🆔 *Session:* \`${sessionId}\`\n_Resume: \`claude --resume ${sessionId}\`_`;
+        threadsWithSessionInfo.add(threadTs);
+      }
+
       await slackRateLimiter.sendMessage(() =>
         app.client.chat.postMessage({
           channel: channel,
-          text: `✅ *Task Complete*\n\n⏱️ Duration: ${timeStr}\n📊 Output Chunks: ${chunkCount}\n📝 Total Output: ${output.length} characters\n✅ Exit Code: ${code}`,
+          text: summaryText,
           thread_ts: threadTs,
           token: process.env.SLACK_BOT_TOKEN
         })
@@ -405,6 +408,11 @@ async function processMessage(event, say, client, isMention) {
       console.log(`[CLOSE] Removing session ${sessionId.slice(0, 8)}... from tracking`);
       sessionTracking.delete(threadTs);
       cleaned = true;
+    }
+
+    // Clear session info flag so new tasks in this thread will show session info again
+    if (threadsWithSessionInfo.has(threadTs)) {
+      threadsWithSessionInfo.delete(threadTs);
     }
 
     // Send confirmation
@@ -524,24 +532,20 @@ USER REQUEST: ${promptWithContext}`;
     // STORE IN CONTEXT
     addToThreadContext(threadTs, msg, response.response || response);
 
-    // Send session info first if available
+    // Track session for cleanup
     if (response.sessionId) {
-      // Track session for cleanup
       sessionTracking.set(threadTs, response.sessionId);
       console.log(`[SESSION] Tracking session ${response.sessionId.slice(0, 8)}... for thread ${threadTs.slice(-8)}`);
-
-      await slackRateLimiter.sendMessage(() =>
-        app.client.chat.postMessage({
-          channel: channel,
-          text: `🆔 *Claude Code Session Started*\n\n*Session ID:* \`${response.sessionId}\`\n\n*To Resume:*\n\`\`\`\nclaude --resume ${response.sessionId}\n\`\`\`\n_Session will be available for resuming until it expires._`,
-          thread_ts: threadTs,
-          token: process.env.SLACK_BOT_TOKEN
-        })
-      ).catch(e => console.error('[SESSION] Failed to send:', e.message));
     }
 
-    // Then send the response
-    const responseText = response.response || response;
+    // Send response with inline session info (only for first reply in thread)
+    let responseText = response.response || response;
+
+    if (response.sessionId && !threadsWithSessionInfo.has(threadTs)) {
+      responseText += `\n\n🆔 *Session:* \`${response.sessionId}\` | _Resume: \`claude --resume ${response.sessionId}\`_`;
+      threadsWithSessionInfo.add(threadTs);
+    }
+
     await say({ text: responseText.slice(0, 3000), thread_ts: threadTs });
 
     await client.reactions.remove({
@@ -614,6 +618,9 @@ app.event("message_metadata_deleted", async ({ event }) => {
       // Remove from session tracking
       sessionTracking.delete(deletedTs);
 
+      // Clear session info flag
+      threadsWithSessionInfo.delete(deletedTs);
+
       console.log(`[CLEANUP] Session cleanup complete for ${deletedTs.slice(-8)}`);
     } else {
       console.log(`[CLEANUP] No session tracked for deleted message ${deletedTs ? deletedTs.slice(-8) : 'unknown'}`);
@@ -646,7 +653,7 @@ setInterval(() => {
 
 app.start().then(() => {
   console.log('╔═══════════════════════════════════════════════════╗');
-  console.log('║  🧠 Context Memory Bridge v2.7.0                  ║');
+  console.log('║  🧠 Context Memory Bridge v2.7.1                  ║');
   console.log('║                                                   ║');
   console.log('║  ✅ Auto-respond in configured channels           ║');
   console.log('║  ✅ Type "close" to stop tasks & cleanup          ║');
