@@ -1,7 +1,6 @@
 require('dotenv').config();
 const { App } = require("@slack/bolt");
 const { spawn } = require("child_process");
-const { buildPromptWithContext, addToThreadContext, getAllThreadContexts } = require("./context");
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -10,14 +9,68 @@ const app = new App({
   appToken: process.env.SLACK_APP_TOKEN
 });
 
-// Track running tasks
-const runningTasks = new Map(); // threadId -> { process, startTime }
-
-// Track thread to session ID mapping for cleanup
-const sessionTracking = new Map(); // threadId -> sessionId
+// Enhanced session tracking - single source of truth
+const threadSessions = new Map(); // threadId -> { sessionId, process, startTime, lastActivity, type }
 
 // Track threads that have already shown session info (only show once per thread)
 const threadsWithSessionInfo = new Set(); // threadId
+
+// Proper process cleanup helper
+async function cleanupProcess(process, threadId) {
+  if (!process || process.killed) return;
+
+  return new Promise((resolve) => {
+    const pid = process.pid;
+    console.log(`[CLEANUP] Sending SIGTERM to process ${pid} for thread ${threadId.slice(-8)}`);
+
+    // Try graceful shutdown first
+    process.kill('SIGTERM');
+
+    // Give it 5 seconds to exit gracefully
+    const forceKillTimer = setTimeout(() => {
+      if (!process.killed) {
+        console.log(`[CLEANUP] Process ${pid} didn't exit, sending SIGKILL`);
+        try {
+          process.kill('SIGKILL');
+        } catch (e) {
+          console.error(`[CLEANUP] SIGKILL failed:`, e.message);
+        }
+      }
+      resolve();
+    }, 5000);
+
+    // If it exits before timeout, cancel force kill
+    process.on('exit', () => {
+      clearTimeout(forceKillTimer);
+      console.log(`[CLEANUP] Process ${pid} exited cleanly`);
+      resolve();
+    });
+  });
+}
+
+// Clean up thread session completely
+async function cleanupThreadSession(threadId, reason = 'unknown') {
+  console.log(`[CLEANUP] Cleaning up thread ${threadId.slice(-8)}, reason: ${reason}`);
+
+  if (!threadSessions.has(threadId)) {
+    console.log(`[CLEANUP] No session found for thread ${threadId.slice(-8)}`);
+    return false;
+  }
+
+  const session = threadSessions.get(threadId);
+
+  // Kill process if running
+  if (session.process && !session.process.killed) {
+    await cleanupProcess(session.process, threadId);
+  }
+
+  // Remove from all tracking
+  threadSessions.delete(threadId);
+  threadsWithSessionInfo.delete(threadId);
+
+  console.log(`[CLEANUP] Cleanup complete for thread ${threadId.slice(-8)}, session ${session.sessionId?.slice(0, 8) || 'unknown'}`);
+  return true;
+}
 
 // Rate limiter for Slack API calls
 class SlackRateLimiter {
@@ -84,6 +137,10 @@ async function askClaudeAsync(prompt, originalMsg, channel, threadTs, client) {
 
   const startTime = Date.now();
 
+  // Check if thread has existing session
+  const existingSession = threadSessions.get(threadTs);
+  const hasExistingSession = existingSession && existingSession.sessionId;
+
   // Add Docker environment context for backend tests
   const enhancedPrompt = `SYSTEM CONTEXT: Docker-based development environment.
 Backend (Java/Kotlin/Gradle) runs ONLY in Docker containers.
@@ -92,12 +149,22 @@ NEVER say "Java is not installed" - use Docker!
 
 USER REQUEST: ${prompt}`;
 
-  const claude = spawn('/usr/bin/claude', [
+  // Build command args - use --resume if session exists
+  const claudeArgs = [
     '-p', enhancedPrompt,
     '--dangerously-skip-permissions',
     '--output-format', 'stream-json',
     '--verbose'
-  ], {
+  ];
+
+  if (hasExistingSession) {
+    claudeArgs.push('--resume', existingSession.sessionId);
+    console.log(`[SESSION] Resuming session ${existingSession.sessionId.slice(0, 8)}... for thread ${threadTs.slice(-8)}`);
+  } else {
+    console.log(`[SESSION] Starting new session for thread ${threadTs.slice(-8)}`);
+  }
+
+  const claude = spawn('/usr/bin/claude', claudeArgs, {
     cwd: '/opt/devenv/projects/sphinx-ai',
     env: {
       ...process.env,
@@ -109,7 +176,14 @@ USER REQUEST: ${prompt}`;
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
-  runningTasks.set(threadTs, { process: claude, startTime });
+  // Track in thread sessions
+  threadSessions.set(threadTs, {
+    sessionId: existingSession?.sessionId || null,
+    process: claude,
+    startTime,
+    lastActivity: Date.now(),
+    type: 'async'
+  });
 
   let output = '';
   let outputBuffer = ''; // Buffer for chunked streaming
@@ -211,10 +285,13 @@ USER REQUEST: ${prompt}`;
               // Session initialization
               if (msg.subtype === 'init' && msg.session_id) {
                 sessionId = msg.session_id;
-                // Track session for cleanup
-                sessionTracking.set(threadTs, sessionId);
-                console.log(`[SESSION] Tracking session ${sessionId.slice(0, 8)}... for thread ${threadTs.slice(-8)}`);
-                // Don't send separate message - will be included inline with response
+                // Update session in thread tracking
+                if (threadSessions.has(threadTs)) {
+                  const session = threadSessions.get(threadTs);
+                  session.sessionId = sessionId;
+                  session.lastActivity = Date.now();
+                  console.log(`[SESSION] Session ID ${sessionId.slice(0, 8)}... registered for thread ${threadTs.slice(-8)}`);
+                }
               }
               break;
 
@@ -287,12 +364,7 @@ USER REQUEST: ${prompt}`;
     // Stream any remaining buffered output
     await streamBuffer(true);
 
-    runningTasks.delete(threadTs);
-
     const response = output.trim() || 'Task completed (no output)';
-
-    // STORE IN CONTEXT
-    addToThreadContext(threadTs, originalMsg, response);
 
     // Send final summary
     try {
@@ -385,35 +457,7 @@ async function processMessage(event, say, client, isMention) {
 
   // Handle "close" command - cleanup session
   if (msg.toLowerCase() === 'close') {
-    console.log(`[CLOSE] Close command received for thread ${threadTs.slice(-8)}`);
-
-    let cleaned = false;
-
-    // Kill running process if exists
-    if (runningTasks.has(threadTs)) {
-      const task = runningTasks.get(threadTs);
-      try {
-        task.process.kill('SIGTERM');
-        console.log(`[CLOSE] Killed Claude process for thread ${threadTs.slice(-8)}`);
-        cleaned = true;
-      } catch (e) {
-        console.error(`[CLOSE] Failed to kill process:`, e.message);
-      }
-      runningTasks.delete(threadTs);
-    }
-
-    // Remove session tracking
-    if (sessionTracking.has(threadTs)) {
-      const sessionId = sessionTracking.get(threadTs);
-      console.log(`[CLOSE] Removing session ${sessionId.slice(0, 8)}... from tracking`);
-      sessionTracking.delete(threadTs);
-      cleaned = true;
-    }
-
-    // Clear session info flag so new tasks in this thread will show session info again
-    if (threadsWithSessionInfo.has(threadTs)) {
-      threadsWithSessionInfo.delete(threadTs);
-    }
+    const cleaned = await cleanupThreadSession(threadTs, 'close command');
 
     // Send confirmation
     if (cleaned) {
@@ -429,14 +473,6 @@ async function processMessage(event, say, client, isMention) {
     }
 
     return; // Don't process as normal message
-  }
-
-  // BUILD PROMPT WITH CONTEXT - This is the key change!
-  const promptWithContext = buildPromptWithContext(threadTs, msg);
-
-  // Log if using context
-  if (promptWithContext !== msg) {
-    console.log(`[CONTEXT] Using history for context`);
   }
 
   // Detect if this is likely a long-running task
@@ -457,8 +493,8 @@ async function processMessage(event, say, client, isMention) {
       name: "rocket"
     }).catch(() => {});
 
-    // Start async task (doesn't wait) - pass original msg for context storage
-    askClaudeAsync(promptWithContext, msg, channel, threadTs, client);
+    // Start async task (Claude Code handles context via --resume)
+    askClaudeAsync(msg, msg, channel, threadTs, client);
 
   } else {
     // Regular short task - wait for response
@@ -470,22 +506,36 @@ async function processMessage(event, say, client, isMention) {
       name: "brain"  // Brain emoji to indicate context awareness
     }).catch(() => {});
 
-    // Quick synchronous execution with context
+    // Check if thread has existing session
+    const existingSession = threadSessions.get(threadTs);
+    const hasExistingSession = existingSession && existingSession.sessionId;
+
+    // Quick synchronous execution
     // Add Docker environment context
     const enhancedPrompt = `SYSTEM CONTEXT: Docker-based development environment.
 Backend (Java/Kotlin/Gradle) runs ONLY in Docker containers.
 For backend tests: Use "docker-compose exec backend ./gradlew test"
 NEVER say "Java is not installed" - use Docker!
 
-USER REQUEST: ${promptWithContext}`;
+USER REQUEST: ${msg}`;
+
+    // Build command args - use --resume if session exists
+    const claudeArgs = [
+      '-p', enhancedPrompt,
+      '--dangerously-skip-permissions',
+      '--output-format', 'stream-json',
+      '--verbose'
+    ];
+
+    if (hasExistingSession) {
+      claudeArgs.push('--resume', existingSession.sessionId);
+      console.log(`[SESSION] Resuming session ${existingSession.sessionId.slice(0, 8)}... for thread ${threadTs.slice(-8)}`);
+    } else {
+      console.log(`[SESSION] Starting new session for thread ${threadTs.slice(-8)}`);
+    }
 
     const response = await new Promise((resolve) => {
-      const claude = spawn('/usr/bin/claude', [
-        '-p', enhancedPrompt,
-        '--dangerously-skip-permissions',
-        '--output-format', 'stream-json',
-        '--verbose'
-      ], {
+      const claude = spawn('/usr/bin/claude', claudeArgs, {
         cwd: '/opt/devenv/projects/sphinx-ai',
         env: {
           ...process.env,
@@ -495,6 +545,15 @@ USER REQUEST: ${promptWithContext}`;
           // PATH is inherited from process.env via spread operator
         },
         stdio: ['ignore', 'pipe', 'pipe']
+      });
+
+      // Track in thread sessions
+      threadSessions.set(threadTs, {
+        sessionId: existingSession?.sessionId || null,
+        process: claude,
+        startTime: Date.now(),
+        lastActivity: Date.now(),
+        type: 'sync'
       });
 
       let output = '';
@@ -513,6 +572,12 @@ USER REQUEST: ${promptWithContext}`;
             }
             if (msg.type === 'system' && msg.subtype === 'init' && msg.session_id) {
               syncSessionId = msg.session_id;
+              // Update session in tracking
+              if (threadSessions.has(threadTs)) {
+                threadSessions.get(threadTs).sessionId = syncSessionId;
+                threadSessions.get(threadTs).lastActivity = Date.now();
+                console.log(`[SESSION] Session ID ${syncSessionId.slice(0, 8)}... registered for thread ${threadTs.slice(-8)}`);
+              }
             }
           } catch (e) {
             // Not JSON, ignore
@@ -528,15 +593,6 @@ USER REQUEST: ${promptWithContext}`;
         resolve({ response: result || output.trim() || 'Timeout', sessionId: syncSessionId });
       }, 90000);
     });
-
-    // STORE IN CONTEXT
-    addToThreadContext(threadTs, msg, response.response || response);
-
-    // Track session for cleanup
-    if (response.sessionId) {
-      sessionTracking.set(threadTs, response.sessionId);
-      console.log(`[SESSION] Tracking session ${response.sessionId.slice(0, 8)}... for thread ${threadTs.slice(-8)}`);
-    }
 
     // Send response with inline session info (only for first reply in thread)
     let responseText = response.response || response;
@@ -598,73 +654,50 @@ app.event("message_metadata_deleted", async ({ event }) => {
     console.log(`[CLEANUP] Message metadata deleted event received:`, JSON.stringify(event));
     const deletedTs = event.deleted_ts || event.message_ts || event.ts;
 
-    // Check if this message had an associated session
-    if (sessionTracking.has(deletedTs)) {
-      const sessionId = sessionTracking.get(deletedTs);
-      console.log(`[CLEANUP] Message ${deletedTs.slice(-8)} deleted, cleaning up session ${sessionId.slice(0, 8)}...`);
-
-      // Kill running process if exists
-      if (runningTasks.has(deletedTs)) {
-        const task = runningTasks.get(deletedTs);
-        try {
-          task.process.kill('SIGTERM');
-          console.log(`[CLEANUP] Killed Claude process for deleted thread ${deletedTs.slice(-8)}`);
-        } catch (e) {
-          console.error(`[CLEANUP] Failed to kill process:`, e.message);
-        }
-        runningTasks.delete(deletedTs);
-      }
-
-      // Remove from session tracking
-      sessionTracking.delete(deletedTs);
-
-      // Clear session info flag
-      threadsWithSessionInfo.delete(deletedTs);
-
-      console.log(`[CLEANUP] Session cleanup complete for ${deletedTs.slice(-8)}`);
-    } else {
-      console.log(`[CLEANUP] No session tracked for deleted message ${deletedTs ? deletedTs.slice(-8) : 'unknown'}`);
-    }
+    // Use unified cleanup function
+    await cleanupThreadSession(deletedTs, 'message deleted');
   } catch (error) {
     console.error('[CLEANUP ERROR]', error);
   }
 });
 
-// Show running tasks and context status
-setInterval(() => {
-  if (runningTasks.size > 0) {
-    console.log(`[STATUS] ${runningTasks.size} tasks running`);
-    for (const [threadId, task] of runningTasks.entries()) {
-      const elapsed = ((Date.now() - task.startTime) / 1000).toFixed(0);
-      console.log(`  - Thread ${threadId.slice(-6)}: ${elapsed}s elapsed`);
-    }
-  }
+// Monitor sessions and cleanup orphans
+setInterval(async () => {
+  if (threadSessions.size > 0) {
+    console.log(`[STATUS] ${threadSessions.size} active sessions`);
 
-  // Monitor context storage
-  const threadContexts = getAllThreadContexts();
-  if (threadContexts.size > 0) {
-    console.log(`\n[CONTEXT STATUS] ${threadContexts.size} threads with conversation memory:`);
-    for (const [threadId, ctx] of threadContexts.entries()) {
-      const idleTime = ((Date.now() - ctx.lastActivity) / 1000 / 60).toFixed(1);
-      console.log(`  Thread ...${threadId.slice(-8)}: ${ctx.history.length} exchanges, idle ${idleTime}m`);
+    const now = Date.now();
+    const ORPHAN_TIMEOUT = 2 * 60 * 60 * 1000; // 2 hours
+
+    for (const [threadId, session] of threadSessions.entries()) {
+      const elapsed = ((now - session.startTime) / 1000).toFixed(0);
+      const idle = ((now - session.lastActivity) / 1000 / 60).toFixed(1);
+
+      console.log(`  - Thread ${threadId.slice(-6)}: ${session.type}, ${elapsed}s elapsed, idle ${idle}m, session ${session.sessionId?.slice(0, 8) || 'pending'}...`);
+
+      // Detect and cleanup orphan processes (inactive for > 2 hours)
+      if (now - session.lastActivity > ORPHAN_TIMEOUT) {
+        console.log(`[ORPHAN] Detected orphan session for thread ${threadId.slice(-8)}, idle ${idle}m - cleaning up`);
+        await cleanupThreadSession(threadId, 'orphan timeout');
+      }
     }
   }
 }, 2 * 60 * 1000); // Status every 2 minutes
 
 app.start().then(() => {
   console.log('╔═══════════════════════════════════════════════════╗');
-  console.log('║  🧠 Context Memory Bridge v2.7.1                  ║');
+  console.log('║  🧠 Slack-Claude Bridge v3.0.0                    ║');
   console.log('║                                                   ║');
+  console.log('║  ✅ Native Claude session resuming (--resume)     ║');
   console.log('║  ✅ Auto-respond in configured channels           ║');
-  console.log('║  ✅ Type "close" to stop tasks & cleanup          ║');
-  console.log('║  ✅ Remembers conversations within threads        ║');
+  console.log('║  ✅ Type "close" to stop & cleanup                ║');
+  console.log('║  ✅ Robust process cleanup (SIGTERM/SIGKILL)      ║');
+  console.log('║  ✅ Orphan detection & auto-cleanup               ║');
   console.log('║  ✅ Structured JSON streaming                     ║');
   console.log('║  ✅ Rate-limited Slack API (1 msg/sec)            ║');
-  console.log('║  ✅ Session ID tracking & resuming                ║');
+  console.log('║  ✅ Session inline with first reply               ║');
   console.log('║  ✅ Real-time tool execution updates              ║');
-  console.log('║  ✅ Stores last 10 exchanges per thread           ║');
-  console.log('║  ✅ Auto-cleanup after 30min idle                 ║');
   console.log('║  ✅ Docker-aware for backend tests                ║');
   console.log('╚═══════════════════════════════════════════════════╗');
-  console.log('Ready! Type "close" to stop tasks.');
+  console.log('Ready! Claude manages context natively via --resume.');
 });
