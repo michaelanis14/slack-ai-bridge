@@ -209,7 +209,7 @@ USER REQUEST: ${prompt}`;
                 slackRateLimiter.sendMessage(() =>
                   app.client.chat.postMessage({
                     channel: channel,
-                    text: `📋 *Session Started*\n\`${sessionId}\`\n_Resume: \`claude --resume ${sessionId}\`_`,
+                    text: `🆔 *Claude Code Session Started*\n\n*Session ID:* \`${sessionId}\`\n\n*To Resume:*\n\`\`\`\nclaude --resume ${sessionId}\n\`\`\`\n*View Full Session:* https://claude.ai/code/${sessionId}\n\n_Session will be available for resuming until it expires._`,
                     thread_ts: threadTs,
                     token: process.env.SLACK_BOT_TOKEN
                   })
@@ -434,16 +434,20 @@ USER REQUEST: ${promptWithContext}`;
 
       let output = '';
       let result = '';
+      let syncSessionId = null;
 
       claude.stdout.on('data', d => {
         output += d.toString();
-        // Try to extract result from JSON stream
+        // Try to extract result and session ID from JSON stream
         const lines = output.split('\n');
         for (const line of lines) {
           try {
             const msg = JSON.parse(line);
             if (msg.type === 'result' && msg.result) {
               result = msg.result;
+            }
+            if (msg.type === 'system' && msg.subtype === 'init' && msg.session_id) {
+              syncSessionId = msg.session_id;
             }
           } catch (e) {
             // Not JSON, ignore
@@ -452,18 +456,32 @@ USER REQUEST: ${promptWithContext}`;
       });
 
       claude.stderr.on('data', d => output += d);
-      claude.on('close', () => resolve(result || output.trim() || 'No output'));
+      claude.on('close', () => resolve({ response: result || output.trim() || 'No output', sessionId: syncSessionId }));
 
       setTimeout(() => {
         claude.kill();
-        resolve(result || output.trim() || 'Timeout');
+        resolve({ response: result || output.trim() || 'Timeout', sessionId: syncSessionId });
       }, 90000);
     });
 
     // STORE IN CONTEXT
-    addToThreadContext(threadTs, msg, response);
+    addToThreadContext(threadTs, msg, response.response || response);
 
-    await say({ text: response.slice(0, 3000), thread_ts: threadTs });
+    // Send session info first if available
+    if (response.sessionId) {
+      await slackRateLimiter.sendMessage(() =>
+        app.client.chat.postMessage({
+          channel: channel,
+          text: `🆔 *Claude Code Session Started*\n\n*Session ID:* \`${response.sessionId}\`\n\n*To Resume:*\n\`\`\`\nclaude --resume ${response.sessionId}\n\`\`\`\n*View Full Session:* https://claude.ai/code/${response.sessionId}\n\n_Session will be available for resuming until it expires._`,
+          thread_ts: threadTs,
+          token: process.env.SLACK_BOT_TOKEN
+        })
+      ).catch(e => console.error('[SESSION] Failed to send:', e.message));
+    }
+
+    // Then send the response
+    const responseText = response.response || response;
+    await say({ text: responseText.slice(0, 3000), thread_ts: threadTs });
 
     await client.reactions.remove({
       channel: channel,
@@ -532,7 +550,7 @@ setInterval(() => {
 
 app.start().then(() => {
   console.log('╔═══════════════════════════════════════════════════╗');
-  console.log('║  🧠 Context Memory Bridge v2.5.1                  ║');
+  console.log('║  🧠 Context Memory Bridge v2.5.2                  ║');
   console.log('║                                                   ║');
   console.log('║  ✅ Auto-respond in configured channels           ║');
   console.log('║  ✅ Remembers conversations within threads        ║');
