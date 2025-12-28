@@ -485,13 +485,11 @@ app.event("message", async ({ event, say, client }) => {
     // Ignore bot messages
     if (event.bot_id || event.subtype === 'bot_message') return;
 
-    // Ignore threaded messages (they'll be handled by app_mention or message in thread)
-    if (event.thread_ts) return;
-
     // Only respond in configured auto-respond channels
     if (!autoRespondChannels.has(event.channel)) return;
 
-    console.log(`[AUTO-CHANNEL] Message in ${event.channel}`);
+    const messageType = event.thread_ts ? 'thread reply' : 'channel message';
+    console.log(`[AUTO-CHANNEL] ${messageType} in ${event.channel}`);
     await processMessage(event, say, client, false);
   } catch (error) {
     console.error('[AUTO-CHANNEL ERROR]', error);
@@ -534,7 +532,7 @@ setInterval(() => {
 
 app.start().then(() => {
   console.log('╔═══════════════════════════════════════════════════╗');
-  console.log('║  🧠 Context Memory Bridge v2.5.0                  ║');
+  console.log('║  🧠 Context Memory Bridge v2.5.1                  ║');
   console.log('║                                                   ║');
   console.log('║  ✅ Auto-respond in configured channels           ║');
   console.log('║  ✅ Remembers conversations within threads        ║');
