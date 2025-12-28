@@ -380,6 +380,49 @@ async function processMessage(event, say, client, isMention) {
   console.log(`Thread ID: ${threadTs}`);
   console.log(`${'='.repeat(60)}`);
 
+  // Handle "close" command - cleanup session
+  if (msg.toLowerCase() === 'close') {
+    console.log(`[CLOSE] Close command received for thread ${threadTs.slice(-8)}`);
+
+    let cleaned = false;
+
+    // Kill running process if exists
+    if (runningTasks.has(threadTs)) {
+      const task = runningTasks.get(threadTs);
+      try {
+        task.process.kill('SIGTERM');
+        console.log(`[CLOSE] Killed Claude process for thread ${threadTs.slice(-8)}`);
+        cleaned = true;
+      } catch (e) {
+        console.error(`[CLOSE] Failed to kill process:`, e.message);
+      }
+      runningTasks.delete(threadTs);
+    }
+
+    // Remove session tracking
+    if (sessionTracking.has(threadTs)) {
+      const sessionId = sessionTracking.get(threadTs);
+      console.log(`[CLOSE] Removing session ${sessionId.slice(0, 8)}... from tracking`);
+      sessionTracking.delete(threadTs);
+      cleaned = true;
+    }
+
+    // Send confirmation
+    if (cleaned) {
+      await say({
+        text: `🛑 *Session Closed*\n\nStopped running task and cleaned up session for this thread.`,
+        thread_ts: threadTs
+      });
+    } else {
+      await say({
+        text: `ℹ️ No active session found for this thread.`,
+        thread_ts: threadTs
+      });
+    }
+
+    return; // Don't process as normal message
+  }
+
   // BUILD PROMPT WITH CONTEXT - This is the key change!
   const promptWithContext = buildPromptWithContext(threadTs, msg);
 
@@ -603,9 +646,10 @@ setInterval(() => {
 
 app.start().then(() => {
   console.log('╔═══════════════════════════════════════════════════╗');
-  console.log('║  🧠 Context Memory Bridge v2.6.2                  ║');
+  console.log('║  🧠 Context Memory Bridge v2.7.0                  ║');
   console.log('║                                                   ║');
   console.log('║  ✅ Auto-respond in configured channels           ║');
+  console.log('║  ✅ Type "close" to stop tasks & cleanup          ║');
   console.log('║  ✅ Remembers conversations within threads        ║');
   console.log('║  ✅ Structured JSON streaming                     ║');
   console.log('║  ✅ Rate-limited Slack API (1 msg/sec)            ║');
@@ -615,5 +659,5 @@ app.start().then(() => {
   console.log('║  ✅ Auto-cleanup after 30min idle                 ║');
   console.log('║  ✅ Docker-aware for backend tests                ║');
   console.log('╚═══════════════════════════════════════════════════╗');
-  console.log('Ready! No @mention needed in configured channels.');
+  console.log('Ready! Type "close" to stop tasks.');
 });
