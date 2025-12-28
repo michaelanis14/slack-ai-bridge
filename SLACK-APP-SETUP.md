@@ -47,6 +47,9 @@ This guide covers the complete setup for the Slack-Claude Bridge, including all 
 - `chat:write.public` - Send messages to channels without joining
 - `reactions:write` - Add emoji reactions to messages
 
+**Message Metadata (for deletion tracking):**
+- `metadata.message:read` - Read message metadata (required for message_metadata_deleted event)
+
 **File Access (optional, for future features):**
 - `files:read` - View files shared in channels
 - `files:write` - Upload files
@@ -72,7 +75,8 @@ This guide covers the complete setup for the Slack-Claude Bridge, including all 
 - `app_mention` - Listen for @mentions
 - `message.channels` - Listen to messages in public channels (for auto-respond)
 - `message.im` - Listen to direct messages
-- `message_deleted` - **[NEW]** Listen for message deletions (for session cleanup)
+- `message_metadata_deleted` - **[NEW]** Listen for message deletions (for session cleanup)
+  - Also requires scope: `metadata.message:read`
 
 4. Click **Save Changes**
 5. Slack will prompt you to **reinstall the app** - click **Reinstall App**
@@ -171,10 +175,11 @@ You should see:
 - Check Slack app manifest for event subscriptions
 
 ### Session Cleanup Not Working
-- Verify `message_deleted` event is subscribed
-- Reinstall app after adding the event
+- Verify `message_metadata_deleted` event is subscribed (NOT `message_deleted`)
+- Add `metadata.message:read` scope
+- Reinstall app after adding the event and scope
 - Check logs for "[CLEANUP]" messages
-- Ensure bot has permission to read message history
+- Test by deleting a message and checking logs: `sudo journalctl -u slack-claude-bridge -f`
 
 ### Permission Errors
 - Review OAuth scopes in app settings
@@ -216,6 +221,7 @@ oauth_config:
       - im:read
       - im:write
       - reactions:write
+      - metadata.message:read
       - files:read
       - files:write
 settings:
@@ -224,7 +230,7 @@ settings:
       - app_mention
       - message.channels
       - message.im
-      - message_deleted
+      - message_metadata_deleted
   interactivity:
     is_enabled: false
   org_deploy_enabled: false

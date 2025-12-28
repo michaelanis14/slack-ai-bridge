@@ -546,9 +546,10 @@ app.event("app_mention", async ({ event, say, client }) => {
 });
 
 // Handle message deletions - cleanup associated sessions
-app.event("message_deleted", async ({ event }) => {
+app.event("message_metadata_deleted", async ({ event }) => {
   try {
-    const deletedTs = event.deleted_ts;
+    console.log(`[CLEANUP] Message metadata deleted event received:`, JSON.stringify(event));
+    const deletedTs = event.deleted_ts || event.message_ts || event.ts;
 
     // Check if this message had an associated session
     if (sessionTracking.has(deletedTs)) {
@@ -571,6 +572,8 @@ app.event("message_deleted", async ({ event }) => {
       sessionTracking.delete(deletedTs);
 
       console.log(`[CLEANUP] Session cleanup complete for ${deletedTs.slice(-8)}`);
+    } else {
+      console.log(`[CLEANUP] No session tracked for deleted message ${deletedTs ? deletedTs.slice(-8) : 'unknown'}`);
     }
   } catch (error) {
     console.error('[CLEANUP ERROR]', error);
@@ -600,7 +603,7 @@ setInterval(() => {
 
 app.start().then(() => {
   console.log('╔═══════════════════════════════════════════════════╗');
-  console.log('║  🧠 Context Memory Bridge v2.6.1                  ║');
+  console.log('║  🧠 Context Memory Bridge v2.6.2                  ║');
   console.log('║                                                   ║');
   console.log('║  ✅ Auto-respond in configured channels           ║');
   console.log('║  ✅ Remembers conversations within threads        ║');

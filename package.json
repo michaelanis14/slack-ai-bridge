@@ -1,6 +1,6 @@
 {
   "name": "slack-claude-bridge",
-  "version": "2.6.1",
+  "version": "2.6.2",
   "description": "Bridge between Slack and Claude Code with structured JSON streaming, session tracking, real-time tool updates, conversation context memory, and MCP server access",
   "main": "index.js",
   "scripts": {
