@@ -104,9 +104,13 @@ USER REQUEST: ${prompt}`;
   // Track session info
   let sessionId = null;
   let lineBuffer = ''; // Buffer for incomplete JSON lines
+  let lastHeartbeat = Date.now();
+  const HEARTBEAT_INTERVAL = 60000; // Send heartbeat every 60 seconds if no output
+
   const streamBuffer = async (force = false) => {
     const now = Date.now();
     const timeSinceLastStream = now - lastStreamTime;
+    const timeSinceLastHeartbeat = now - lastHeartbeat;
 
     // Stream if: forced, enough time passed, or buffer is large
     if (force || timeSinceLastStream >= STREAM_INTERVAL || outputBuffer.length >= STREAM_CHUNK_SIZE) {
@@ -136,8 +140,31 @@ USER REQUEST: ${prompt}`;
           // Clear buffer after streaming
           outputBuffer = '';
           lastStreamTime = now;
+          lastHeartbeat = now;
         } catch (error) {
           console.error(`[STREAM] Failed to send chunk:`, error.message);
+        }
+      } else if (timeSinceLastHeartbeat >= HEARTBEAT_INTERVAL && !force) {
+        // Send heartbeat if no output for 60 seconds
+        const elapsed = ((now - startTime) / 1000).toFixed(0);
+        const minutes = Math.floor(elapsed / 60);
+        const seconds = elapsed % 60;
+        const timeStr = minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+
+        try {
+          await slackRateLimiter.sendMessage(() =>
+            app.client.chat.postMessage({
+              channel: channel,
+              text: `⏳ *Still working...* (${timeStr} elapsed)\n_Last output: ${chunkCount > 0 ? `Stream #${chunkCount}` : 'none yet'}_`,
+              thread_ts: threadTs,
+              token: process.env.SLACK_BOT_TOKEN
+            })
+          );
+
+          console.log(`[HEARTBEAT] Thread ${threadTs.slice(-8)}: ${timeStr} elapsed, last chunk #${chunkCount}`);
+          lastHeartbeat = now;
+        } catch (error) {
+          console.error(`[HEARTBEAT] Failed to send:`, error.message);
         }
       }
     }
@@ -470,7 +497,7 @@ setInterval(() => {
 
 app.start().then(() => {
   console.log('╔═══════════════════════════════════════════════════╗');
-  console.log('║  🧠 Context Memory Bridge v2.4                    ║');
+  console.log('║  🧠 Context Memory Bridge v2.4.1                  ║');
   console.log('║                                                   ║');
   console.log('║  ✅ Remembers conversations within threads        ║');
   console.log('║  ✅ Structured JSON streaming                     ║');
